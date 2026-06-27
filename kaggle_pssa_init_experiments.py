@@ -354,6 +354,21 @@ def run_experiments(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Running experiments on: {device} | Seeds: {args.seeds}")
     
+    os.makedirs(args.output_dir, exist_ok=True)
+    output_filename = os.path.join(args.output_dir, f"results_{args.task}.json")
+    
+    # Check for existing results to enable resume capability
+    results = {"task": args.task, "teacher_accuracy": 0.0, "runs": {}}
+    if os.path.exists(output_filename):
+        try:
+            with open(output_filename, "r") as f:
+                loaded_results = json.load(f)
+                if loaded_results.get("task") == args.task:
+                    results = loaded_results
+                    print(f"Loaded existing results file '{output_filename}'. Resuming from previous run...")
+        except Exception as e:
+            print(f"Warning: Could not load existing results file: {e}. Starting fresh.")
+
     # 1. Setup Datasets & Disjoint Optimization Loaders to prevent data leakage
     if args.task == "spiral":
         input_dim = 2
@@ -379,18 +394,35 @@ def run_experiments(args):
         
     criterion = nn.CrossEntropyLoss()
     
-    # 2. Train Teacher Model
-    print(f"\n=== Training Teacher Model ({args.task}) ===")
-    random.seed(args.seeds[0])
-    np.random.seed(args.seeds[0])
-    torch.manual_seed(args.seeds[0])
-    teacher_optimizer = optim.Adam(teacher.parameters(), lr=1e-3, weight_decay=1e-4)
-    _ = train_model(teacher, train_loader, test_loader, criterion, teacher_optimizer, args.teacher_epochs, device)
-    _, final_teacher_acc = evaluate_model(teacher, test_loader, criterion, device)
-    print(f"Teacher Model trained successfully. Final Test Accuracy: {final_teacher_acc:.4f}")
+    # 2. Train or Load Teacher Model
+    print(f"\n=== Setting up Teacher Model ({args.task}) ===")
+    os.makedirs("checkpoints", exist_ok=True)
+    teacher_checkpoint = f"checkpoints/teacher_{args.task}.pth"
     
-    results = {"task": args.task, "teacher_accuracy": final_teacher_acc, "runs": {}}
-    
+    if os.path.exists(teacher_checkpoint) and results.get("teacher_accuracy", 0.0) > 0.0:
+        try:
+            teacher.load_state_dict(torch.load(teacher_checkpoint, map_location=device))
+            print(f"Loaded pre-trained Teacher model from checkpoint. Accuracy: {results['teacher_accuracy']:.4f}")
+        except Exception as e:
+            print(f"Failed to load teacher checkpoint ({e}). Re-training...")
+            results["teacher_accuracy"] = 0.0
+
+    if results.get("teacher_accuracy", 0.0) == 0.0:
+        print("Training Teacher Model...")
+        random.seed(args.seeds[0])
+        np.random.seed(args.seeds[0])
+        torch.manual_seed(args.seeds[0])
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seeds[0])
+        teacher_optimizer = optim.Adam(teacher.parameters(), lr=1e-3, weight_decay=1e-4)
+        _ = train_model(teacher, train_loader, test_loader, criterion, teacher_optimizer, args.teacher_epochs, device)
+        _, final_teacher_acc = evaluate_model(teacher, test_loader, criterion, device)
+        results["teacher_accuracy"] = final_teacher_acc
+        torch.save(teacher.state_dict(), teacher_checkpoint)
+        print(f"Teacher Model trained successfully. Final Test Accuracy: {final_teacher_acc:.4f}")
+        with open(output_filename, "w") as f:
+            json.dump(results, f, indent=4)
+            
     runs_to_execute = [
         {"name": "Xavier Normal", "type": "baseline", "init_fn": lambda m: nn.init.xavier_normal_(m.weight)},
         {"name": "Orthogonal", "type": "baseline", "init_fn": lambda m: nn.init.orthogonal_(m.weight)},
@@ -412,6 +444,12 @@ def run_experiments(args):
     
     for run in runs_to_execute:
         name = run["name"]
+        
+        # Check if already completed and skip
+        if name in results.get("runs", {}):
+            print(f"Skipping completed run: {name}")
+            continue
+            
         print(f"\n--- Running: {name} ---")
         
         seed_results = {
@@ -482,11 +520,12 @@ def run_experiments(args):
             "train_flops_per_epoch": train_flops_per_epoch
         }
         
-    os.makedirs(args.output_dir, exist_ok=True)
-    with open(os.path.join(args.output_dir, f"results_{args.task}.json"), "w") as f:
-        json.dump(results, f, indent=4)
+        # Save checkpoint to disk after each configuration finishes
+        with open(output_filename, "w") as f:
+            json.dump(results, f, indent=4)
+        print(f"Saved checkpoint results for '{name}' to {output_filename}")
         
-    # Generate publication plots
+    print(f"\nAll experiments completed! Final results saved to {output_filename}")
     generate_publication_plots(results, args)
 
 # ==========================================

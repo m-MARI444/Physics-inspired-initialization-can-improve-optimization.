@@ -87,19 +87,31 @@ def main():
         device = args.device
     print(f"Running refined experiments on: {device} with seeds {args.seeds}")
     
+    # Check for existing results to enable resume capability
+    output_filename = f"results_{args.task}.json"
+    results = {"task": args.task, "teacher_accuracy": 0.0, "runs": {}}
+    if os.path.exists(output_filename):
+        try:
+            with open(output_filename, "r") as f:
+                loaded_results = json.load(f)
+                if loaded_results.get("task") == args.task:
+                    results = loaded_results
+                    print(f"Loaded existing results file '{output_filename}'. Resuming from previous run...")
+        except Exception as e:
+            print(f"Warning: Could not load existing results file: {e}. Starting fresh.")
+
+    os.makedirs("checkpoints", exist_ok=True)
+    teacher_checkpoint = f"checkpoints/teacher_{args.task}.pth"
+
     # 1. Setup Datasets & Disjoint Optimization Loaders to prevent data leakage
     if args.task == "spiral":
         input_dim = 2
         output_dim = 3
         batch_size = 128
         
-        # Primary train/test loaders
-        # Using a fixed seed for the dataset split itself to ensure same evaluation domain
         train_loader, test_loader = get_dataloaders(
             'spiral', batch_size=batch_size, n_samples=args.num_samples, n_classes=output_dim, seed=42
         )
-        
-        # Disjoint Optimization Loader for initialization (zero overlap to prevent data leakage)
         optim_loader, _ = get_dataloaders(
             'spiral', batch_size=batch_size, n_samples=1000, n_classes=output_dim, seed=999
         )
@@ -117,12 +129,9 @@ def main():
             transforms.Normalize((0.1307,), (0.3081,))
         ])
         
-        # Load full MNIST training dataset
         mnist_full_train = torchvision.datasets.MNIST(
             root='./data', train=True, download=True, transform=transform
         )
-        # Split into disjoint training and optimization sets (55k training, 5k optimization)
-        # This guarantees zero overlap and prevents data leakage in physics-only activations
         train_subset, optim_subset = random_split(
             mnist_full_train, [55000, 5000], generator=torch.Generator().manual_seed(42)
         )
@@ -140,22 +149,30 @@ def main():
         
     criterion = nn.CrossEntropyLoss()
     
-    # 2. Train Teacher Model (once on first seed, evaluating on test set)
-    print(f"\n=== Training Teacher Model ({args.task}) ===")
-    set_seed(args.seeds[0])
-    teacher_optimizer = optim.Adam(teacher.parameters(), lr=1e-3, weight_decay=1e-4)
-    teacher_history = train_model(
-        teacher, train_loader, test_loader, criterion, teacher_optimizer, args.teacher_epochs, device
-    )
-    final_teacher_loss, final_teacher_acc = evaluate_model(teacher, test_loader, criterion, device)
-    print(f"Teacher Model trained successfully. Final Test Accuracy: {final_teacher_acc:.4f}")
-    
-    results = {
-        "task": args.task,
-        "teacher_accuracy": final_teacher_acc,
-        "runs": {}
-    }
-    
+    # 2. Train or Load Teacher Model
+    print(f"\n=== Setting up Teacher Model ({args.task}) ===")
+    if os.path.exists(teacher_checkpoint) and results.get("teacher_accuracy", 0.0) > 0.0:
+        try:
+            teacher.load_state_dict(torch.load(teacher_checkpoint, map_location=device))
+            print(f"Loaded pre-trained Teacher model from checkpoint. Accuracy: {results['teacher_accuracy']:.4f}")
+        except Exception as e:
+            print(f"Failed to load teacher checkpoint ({e}). Re-training...")
+            results["teacher_accuracy"] = 0.0
+            
+    if results.get("teacher_accuracy", 0.0) == 0.0:
+        print("Training Teacher Model...")
+        set_seed(args.seeds[0])
+        teacher_optimizer = optim.Adam(teacher.parameters(), lr=1e-3, weight_decay=1e-4)
+        _ = train_model(
+            teacher, train_loader, test_loader, criterion, teacher_optimizer, args.teacher_epochs, device
+        )
+        final_teacher_loss, final_teacher_acc = evaluate_model(teacher, test_loader, criterion, device)
+        results["teacher_accuracy"] = final_teacher_acc
+        torch.save(teacher.state_dict(), teacher_checkpoint)
+        print(f"Teacher Model trained successfully. Final Test Accuracy: {final_teacher_acc:.4f}")
+        with open(output_filename, "w") as f:
+            json.dump(results, f, indent=4)
+            
     # Define experimental configurations (Ablation Conditions & K Path sweeps)
     runs_to_execute = [
         {
@@ -265,9 +282,14 @@ def main():
     
     for run in runs_to_execute:
         name = run["name"]
+        
+        # Check if already done (allows resuming safely)
+        if name in results.get("runs", {}):
+            print(f"Skipping completed run: {name}")
+            continue
+            
         print(f"\n--- Running: {name} ---")
         
-        # Lists to aggregate across seeds
         seed_results = {
             "test_acc_history": [],
             "test_loss_history": [],
@@ -290,31 +312,22 @@ def main():
             init_flops = 0.0
             
             if run["type"] == "baseline":
-                # Apply baseline weight init
                 start_t = time.time()
                 run["init_fn"](student)
                 init_time = time.time() - start_t
                 init_flops = 0.0
             else:
-                # PSSA optimization starting from Xavier initial state
                 init_xavier(student)
-                
-                # Solve Stationary Action
                 opt_config = run["config"]
                 
-                # Track wall-clock time of initialization
                 start_t = time.time()
-                # Run optimization on the disjoint optim_loader (no training data overlap)
                 student, _ = optimize_least_action(student, teacher, optim_loader, opt_config)
                 init_time = time.time() - start_t
                 
-                # Calculate estimated FLOPs for the path optimization
                 K_val = opt_config["K"]
                 num_steps = opt_config["num_steps"]
-                # For each step: Teacher Fwd + K * (Student Fwd + Student Bwd)
                 init_flops = num_steps * (fwd_flops_teacher + K_val * (fwd_flops_student + bwd_flops_student))
             
-            # Step-0 measurements (Before any gradient updates/fine-tuning)
             init_variances = measure_layer_variances(student, train_loader, device)
             init_singular_values = measure_singular_values(student)
             init_ranks = get_effective_rank(init_singular_values)
@@ -328,17 +341,15 @@ def main():
             final_loss, final_acc = evaluate_model(student, test_loader, criterion, device)
             print(f"    Finished seed {seed}. Test Accuracy: {final_acc:.4f} | Init Time: {init_time:.2f}s | Init FLOPs: {init_flops:.2e}")
             
-            # Accumulate metrics
             seed_results["test_acc_history"].append(student_history["test_acc"])
             seed_results["test_loss_history"].append(student_history["test_loss"])
-            seed_results["train_acc_history"].append(student_history["train_loss"]) # standard uses train_loss
+            seed_results["train_acc_history"].append(student_history["train_loss"])
             seed_results["train_loss_history"].append(student_history["train_loss"])
             seed_results["init_time"].append(init_time)
             seed_results["init_flops"].append(init_flops)
             seed_results["step0_ranks"].append(init_ranks)
             seed_results["step0_variances"].append(init_variances)
             
-        # Log aggregated results across seeds
         results["runs"][name] = {
             "type": run["type"],
             "test_acc_seeds": seed_results["test_acc_history"],
@@ -350,11 +361,12 @@ def main():
             "train_flops_per_epoch": train_flops_per_epoch
         }
         
-    # Save results to JSON
-    output_filename = f"results_{args.task}.json"
-    with open(output_filename, "w") as f:
-        json.dump(results, f, indent=4)
-    print(f"\nAll experiments completed! Results saved to {output_filename}")
+        # Save after each run to ensure progress is never lost
+        with open(output_filename, "w") as f:
+            json.dump(results, f, indent=4)
+        print(f"Saved checkpoint results for '{name}' to {output_filename}")
+        
+    print(f"\nAll experiments completed! Final results saved to {output_filename}")
 
 if __name__ == "__main__":
     main()
