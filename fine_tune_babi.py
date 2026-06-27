@@ -86,9 +86,10 @@ class BabiSyntheticDataset(Dataset):
 # 2. Evaluation Function
 # ==========================================
 
-def evaluate_babi_accuracy(model, tokenizer, device, num_tests=200):
+def evaluate_babi_accuracy(model, tokenizer, device, num_tests=200, print_samples=10):
     model.eval()
     correct = 0
+    samples_printed = 0
     with torch.no_grad():
         for _ in range(num_tests):
             story, answer = generate_babi_sample()
@@ -101,8 +102,14 @@ def evaluate_babi_accuracy(model, tokenizer, device, num_tests=200):
             pred_id = torch.argmax(last_logits, dim=-1).item()
             pred_word = tokenizer.decode([pred_id]).strip().lower()
             
-            if pred_word == answer.lower():
+            is_correct = (pred_word == answer.lower())
+            if is_correct:
                 correct += 1
+                
+            if samples_printed < print_samples:
+                print(f"      [Sample] Story: {story.strip()}")
+                print(f"               Target: {answer.lower():8s} | Predicted: {pred_word:8s} | Match: {is_correct}")
+                samples_printed += 1
                 
     accuracy = correct / num_tests
     return accuracy
