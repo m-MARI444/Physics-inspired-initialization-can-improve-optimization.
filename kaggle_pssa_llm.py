@@ -1,4 +1,5 @@
 import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import time
 import argparse
 import matplotlib.pyplot as plt
@@ -66,7 +67,6 @@ class PSSALanguageModel(nn.Module):
         V_t = torch.zeros(batch, self.num_slots, device=device)
         
         gates = []
-        logits = []
         slots = []
         
         for t in range(seq_len):
@@ -108,16 +108,16 @@ class PSSALanguageModel(nn.Module):
             
             S_t = S_new
             
-            # 6. Predict Next Token Logits
-            next_logits = self.out_proj(S_t.view(batch, -1))
-            
             gates.append(g_t)
-            logits.append(next_logits)
             slots.append(S_t)
             
         gates_tensor = torch.stack(gates, dim=1) # [batch, seq, num_slots]
-        logits_tensor = torch.stack(logits, dim=1) # [batch, seq, vocab]
         slots_tensor = torch.stack(slots, dim=1) # [batch, seq, num_slots, d_model]
+        
+        # 6. Predict Next Token Logits for all time steps at once (vectorized & memory-efficient)
+        slots_flat = slots_tensor.view(batch * seq_len, self.num_slots * self.d_model)
+        logits_flat = self.out_proj(slots_flat)
+        logits_tensor = logits_flat.view(batch, seq_len, -1)
         
         return logits_tensor, gates_tensor, slots_tensor
 
@@ -170,7 +170,7 @@ def run_campaign(args):
     
     # 4. Optimizer & Scaler
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler = torch.amp.GradScaler('cuda', enabled=(device.type == "cuda"))
     
     history = {
         "step": [],
@@ -201,7 +201,7 @@ def run_campaign(args):
             optimizer.zero_grad()
             
             # Forward pass with mixed-precision
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            with torch.amp.autocast('cuda', enabled=(device.type == "cuda")):
                 logits, gates, slots = model(inputs)
                 
                 # Compute Cross-Entropy Loss
