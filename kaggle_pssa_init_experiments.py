@@ -13,6 +13,7 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
+from huggingface_hub import hf_hub_download, HfApi
 
 # ==========================================
 # 1. Model and Dataset Definition
@@ -348,6 +349,21 @@ def estimate_mlp_fwd_flops(mlp, batch_size):
     flops += batch_size * 2 * mlp.out_layer.in_features * mlp.out_layer.out_features
     return flops
 
+def upload_to_hf(local_file, path_in_repo, repo_id, token):
+    if not repo_id or not token:
+        return
+    try:
+        api = HfApi(token=token)
+        api.upload_file(
+            path_or_fileobj=local_file,
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            repo_type="model"
+        )
+        print(f"📡 Uploaded '{local_file}' to Hugging Face repository '{repo_id}' at '{path_in_repo}'")
+    except Exception as e:
+        print(f"Warning: Failed to upload '{local_file}' to Hugging Face: {e}")
+
 # ==========================================
 # 5. Core Experiments Orchestration
 # ==========================================
@@ -358,20 +374,44 @@ def run_experiments(args):
     
     os.makedirs(args.output_dir, exist_ok=True)
     output_filename = os.path.join(args.output_dir, f"results_{args.task}.json")
+    teacher_checkpoint = f"checkpoints/teacher_{args.task}.pth"
     
-    # Check for existing results to enable resume capability
     results = {"task": args.task, "teacher_accuracy": 0.0, "runs": {}}
+    
+    # 1. HF Hub Restoring logic if config matches
+    if args.hf_repo and args.hf_token:
+        print(f"Checking Hugging Face repository '{args.hf_repo}' for existing checkpoints...")
+        try:
+            api = HfApi(token=args.hf_token)
+            files = api.list_repo_files(repo_id=args.hf_repo)
+            
+            # Download results file
+            results_name = f"results_{args.task}.json"
+            if results_name in files:
+                hf_hub_download(repo_id=args.hf_repo, filename=results_name, token=args.hf_token, local_dir=".")
+                print(f"Successfully recovered '{results_name}' from Hugging Face.")
+                
+            # Download teacher file
+            teacher_name = f"checkpoints/teacher_{args.task}.pth"
+            if teacher_name in files:
+                os.makedirs("checkpoints", exist_ok=True)
+                hf_hub_download(repo_id=args.hf_repo, filename=teacher_name, token=args.hf_token, local_dir=".")
+                print(f"Successfully recovered teacher checkpoint from Hugging Face.")
+        except Exception as e:
+            print(f"Note: Could not recover from HF Hub (this is fine for fresh runs): {e}")
+
+    # Check local filesystem (potentially recovered from HF)
     if os.path.exists(output_filename):
         try:
             with open(output_filename, "r") as f:
                 loaded_results = json.load(f)
                 if loaded_results.get("task") == args.task:
                     results = loaded_results
-                    print(f"Loaded existing results file '{output_filename}'. Resuming from previous run...")
+                    print(f"Resuming from results file: {len(results.get('runs', {}))} configurations already completed.")
         except Exception as e:
-            print(f"Warning: Could not load existing results file: {e}. Starting fresh.")
+            print(f"Warning: Could not load existing results file: {e}")
 
-    # 1. Setup Datasets & Disjoint Optimization Loaders to prevent data leakage
+    # Setup Datasets & Disjoint Optimization Loaders to prevent data leakage
     if args.task == "spiral":
         input_dim = 2
         output_dim = 3
@@ -396,11 +436,8 @@ def run_experiments(args):
         
     criterion = nn.CrossEntropyLoss()
     
-    # 2. Train or Load Teacher Model
+    # Train or Load Teacher Model
     print(f"\n=== Setting up Teacher Model ({args.task}) ===")
-    os.makedirs("checkpoints", exist_ok=True)
-    teacher_checkpoint = f"checkpoints/teacher_{args.task}.pth"
-    
     if os.path.exists(teacher_checkpoint) and results.get("teacher_accuracy", 0.0) > 0.0:
         try:
             teacher.load_state_dict(torch.load(teacher_checkpoint, map_location=device))
@@ -422,8 +459,12 @@ def run_experiments(args):
         results["teacher_accuracy"] = final_teacher_acc
         torch.save(teacher.state_dict(), teacher_checkpoint)
         print(f"Teacher Model trained successfully. Final Test Accuracy: {final_teacher_acc:.4f}")
+        
+        # Save and upload teacher immediately to HF
         with open(output_filename, "w") as f:
             json.dump(results, f, indent=4)
+        upload_to_hf(output_filename, f"results_{args.task}.json", args.hf_repo, args.hf_token)
+        upload_to_hf(teacher_checkpoint, f"checkpoints/teacher_{args.task}.pth", args.hf_repo, args.hf_token)
             
     runs_to_execute = [
         {"name": "Xavier Normal", "type": "baseline", "init_fn": lambda m: nn.init.xavier_normal_(m.weight)},
@@ -522,10 +563,13 @@ def run_experiments(args):
             "train_flops_per_epoch": train_flops_per_epoch
         }
         
-        # Save checkpoint to disk after each configuration finishes
+        # Save checkpoint locally
         with open(output_filename, "w") as f:
             json.dump(results, f, indent=4)
         print(f"Saved checkpoint results for '{name}' to {output_filename}")
+        
+        # Upload checkpoint results to HF repository to survive Kaggle ephemeral disk wipe
+        upload_to_hf(output_filename, f"results_{args.task}.json", args.hf_repo, args.hf_token)
         
     print(f"\nAll experiments completed! Final results saved to {output_filename}")
     generate_publication_plots(results, args)
@@ -579,7 +623,8 @@ def generate_publication_plots(results, args):
     axes[1].legend(loc="upper right")
     
     plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, f"learning_curves_{args.task}.png"), dpi=150, bbox_inches='tight')
+    plot1_path = os.path.join(args.output_dir, f"learning_curves_{args.task}.png")
+    plt.savefig(plot1_path, dpi=150, bbox_inches='tight')
     plt.close()
     
     # Plot 2: Compute Efficiency
@@ -598,7 +643,8 @@ def generate_publication_plots(results, args):
     plt.ylabel("Test Accuracy")
     plt.xscale("log")
     plt.legend(loc="lower right")
-    plt.savefig(os.path.join(args.output_dir, f"compute_efficiency_{args.task}.png"), dpi=150, bbox_inches='tight')
+    plot2_path = os.path.join(args.output_dir, f"compute_efficiency_{args.task}.png")
+    plt.savefig(plot2_path, dpi=150, bbox_inches='tight')
     plt.close()
     
     # Plot 3: Activation Variance
@@ -614,7 +660,8 @@ def generate_publication_plots(results, args):
     plt.xlabel("Layer Index (0=Input, L=Output)")
     plt.ylabel("Variance")
     plt.legend(loc="best")
-    plt.savefig(os.path.join(args.output_dir, f"activation_variances_{args.task}.png"), dpi=150, bbox_inches='tight')
+    plot3_path = os.path.join(args.output_dir, f"activation_variances_{args.task}.png")
+    plt.savefig(plot3_path, dpi=150, bbox_inches='tight')
     plt.close()
     
     # Plot 4: Effective Rank
@@ -641,8 +688,19 @@ def generate_publication_plots(results, args):
         plt.ylabel("Weight Matrix Singular Value Entropy (Effective Rank)")
         plt.title("Step-0 Weight Matrix Effective Rank Comparison")
         plt.tight_layout()
-        plt.savefig(os.path.join(args.output_dir, f"singular_values_{args.task}.png"), dpi=150, bbox_inches='tight')
+        plot4_path = os.path.join(args.output_dir, f"singular_values_{args.task}.png")
+        plt.savefig(plot4_path, dpi=150, bbox_inches='tight')
         plt.close()
+        
+    # Upload all final plots directly to Hugging Face
+    if args.hf_repo and args.hf_token:
+        print("📡 Uploading final evaluation figures to Hugging Face...")
+        upload_to_hf(plot1_path, f"results/learning_curves_{args.task}.png", args.hf_repo, args.hf_token)
+        upload_to_hf(plot2_path, f"results/compute_efficiency_{args.task}.png", args.hf_repo, args.hf_token)
+        upload_to_hf(plot3_path, f"results/activation_variances_{args.task}.png", args.hf_repo, args.hf_token)
+        if run_names:
+            upload_to_hf(plot4_path, f"results/singular_values_{args.task}.png", args.hf_repo, args.hf_token)
+        print("✅ Hugging Face upload of all figures completed!")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PSSA Refined Kaggle Experiments")
@@ -652,5 +710,7 @@ if __name__ == "__main__":
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
     parser.add_argument("--num_samples", type=int, default=2000)
     parser.add_argument("--output_dir", type=str, default="./results")
+    parser.add_argument("--hf_repo", type=str, default="", help="Hugging Face repository ID to persist checkpoints")
+    parser.add_argument("--hf_token", type=str, default="", help="Hugging Face API write token")
     args = parser.parse_args()
     run_experiments(args)

@@ -10,6 +10,7 @@ import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, random_split
+from huggingface_hub import hf_hub_download, HfApi
 
 from pssa.models import MLP, clone_model
 from pssa.datasets import get_dataloaders, SyntheticDataset
@@ -65,6 +66,21 @@ def estimate_mlp_fwd_flops(mlp, batch_size):
     flops += batch_size * 2 * mlp.out_layer.in_features * mlp.out_layer.out_features
     return flops
 
+def upload_to_hf(local_file, path_in_repo, repo_id, token):
+    if not repo_id or not token:
+        return
+    try:
+        api = HfApi(token=token)
+        api.upload_file(
+            path_or_fileobj=local_file,
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            repo_type="model"
+        )
+        print(f"📡 Uploaded '{local_file}' to Hugging Face repository '{repo_id}' at '{path_in_repo}'")
+    except Exception as e:
+        print(f"Warning: Failed to upload '{local_file}' to Hugging Face: {e}")
+
 def main():
     parser = argparse.ArgumentParser(description="PSSA Refined Weight Initialization Experiments")
     parser.add_argument("--task", type=str, default="spiral", choices=["spiral", "mnist"],
@@ -79,6 +95,12 @@ def main():
                         help="List of random seeds for replication")
     parser.add_argument("--num_samples", type=int, default=2000,
                         help="Number of samples for synthetic spiral task")
+    parser.add_argument("--output_dir", type=str, default="./results",
+                        help="Directory to save output files")
+    parser.add_argument("--hf_repo", type=str, default="",
+                        help="Hugging Face repository ID to persist checkpoints")
+    parser.add_argument("--hf_token", type=str, default="",
+                        help="Hugging Face API write token")
     args = parser.parse_args()
     
     if args.device == "auto":
@@ -87,23 +109,48 @@ def main():
         device = args.device
     print(f"Running refined experiments on: {device} with seeds {args.seeds}")
     
-    # Check for existing results to enable resume capability
-    output_filename = f"results_{args.task}.json"
+    os.makedirs(args.output_dir, exist_ok=True)
+    output_filename = os.path.join(args.output_dir, f"results_{args.task}.json")
+    teacher_checkpoint = f"checkpoints/teacher_{args.task}.pth"
+    
     results = {"task": args.task, "teacher_accuracy": 0.0, "runs": {}}
+    
+    # 1. Recover from Hugging Face if config matches
+    if args.hf_repo and args.hf_token:
+        print(f"Checking Hugging Face repository '{args.hf_repo}' for existing checkpoints...")
+        try:
+            api = HfApi(token=args.hf_token)
+            files = api.list_repo_files(repo_id=args.hf_repo)
+            
+            # Download results file
+            results_name = f"results_{args.task}.json"
+            if results_name in files:
+                hf_hub_download(repo_id=args.hf_repo, filename=results_name, token=args.hf_token, local_dir=".")
+                print(f"Successfully recovered '{results_name}' from Hugging Face.")
+                
+            # Download teacher file
+            teacher_name = f"checkpoints/teacher_{args.task}.pth"
+            if teacher_name in files:
+                os.makedirs("checkpoints", exist_ok=True)
+                hf_hub_download(repo_id=args.hf_repo, filename=teacher_name, token=args.hf_token, local_dir=".")
+                print(f"Successfully recovered teacher checkpoint from Hugging Face.")
+        except Exception as e:
+            print(f"Note: Could not recover from HF Hub: {e}")
+
+    # Check local filesystem
     if os.path.exists(output_filename):
         try:
             with open(output_filename, "r") as f:
                 loaded_results = json.load(f)
                 if loaded_results.get("task") == args.task:
                     results = loaded_results
-                    print(f"Loaded existing results file '{output_filename}'. Resuming from previous run...")
+                    print(f"Resuming from results file: {len(results.get('runs', {}))} configurations already completed.")
         except Exception as e:
-            print(f"Warning: Could not load existing results file: {e}. Starting fresh.")
+            print(f"Warning: Could not load existing results file: {e}")
 
     os.makedirs("checkpoints", exist_ok=True)
-    teacher_checkpoint = f"checkpoints/teacher_{args.task}.pth"
 
-    # 1. Setup Datasets & Disjoint Optimization Loaders to prevent data leakage
+    # Setup Datasets & Disjoint Optimization Loaders to prevent data leakage
     if args.task == "spiral":
         input_dim = 2
         output_dim = 3
@@ -149,7 +196,7 @@ def main():
         
     criterion = nn.CrossEntropyLoss()
     
-    # 2. Train or Load Teacher Model
+    # Train or Load Teacher Model
     print(f"\n=== Setting up Teacher Model ({args.task}) ===")
     if os.path.exists(teacher_checkpoint) and results.get("teacher_accuracy", 0.0) > 0.0:
         try:
@@ -170,8 +217,12 @@ def main():
         results["teacher_accuracy"] = final_teacher_acc
         torch.save(teacher.state_dict(), teacher_checkpoint)
         print(f"Teacher Model trained successfully. Final Test Accuracy: {final_teacher_acc:.4f}")
+        
+        # Save and upload teacher immediately to HF
         with open(output_filename, "w") as f:
             json.dump(results, f, indent=4)
+        upload_to_hf(output_filename, f"results_{args.task}.json", args.hf_repo, args.hf_token)
+        upload_to_hf(teacher_checkpoint, f"checkpoints/teacher_{args.task}.pth", args.hf_repo, args.hf_token)
             
     # Define experimental configurations (Ablation Conditions & K Path sweeps)
     runs_to_execute = [
@@ -274,9 +325,7 @@ def main():
     # Pre-calculate layer-wise FLOP sizes for compute efficiency tracking
     fwd_flops_teacher = estimate_mlp_fwd_flops(teacher, batch_size)
     fwd_flops_student = estimate_mlp_fwd_flops(student_base, batch_size)
-    bwd_flops_student = 2 * fwd_flops_student  # Standard backpropagation approximation
-    
-    # Calculate training FLOPs per epoch
+    bwd_flops_student = 2 * fwd_flops_student
     num_batches = len(train_loader)
     train_flops_per_epoch = num_batches * (fwd_flops_student + bwd_flops_student)
     
@@ -305,9 +354,7 @@ def main():
             print(f"  > Seed {seed}...")
             set_seed(seed)
             
-            # Clone student base structure
             student = clone_model(student_base)
-            
             init_time = 0.0
             init_flops = 0.0
             
@@ -332,7 +379,6 @@ def main():
             init_singular_values = measure_singular_values(student)
             init_ranks = get_effective_rank(init_singular_values)
             
-            # Fine-tune the student model
             student_optimizer = optim.Adam(student.parameters(), lr=1e-3, weight_decay=1e-4)
             student_history = train_model(
                 student, train_loader, test_loader, criterion, student_optimizer, args.epochs, device
@@ -361,10 +407,13 @@ def main():
             "train_flops_per_epoch": train_flops_per_epoch
         }
         
-        # Save after each run to ensure progress is never lost
+        # Save checkpoint locally
         with open(output_filename, "w") as f:
             json.dump(results, f, indent=4)
         print(f"Saved checkpoint results for '{name}' to {output_filename}")
+        
+        # Upload checkpoint to HF
+        upload_to_hf(output_filename, f"results_{args.task}.json", args.hf_repo, args.hf_token)
         
     print(f"\nAll experiments completed! Final results saved to {output_filename}")
 
