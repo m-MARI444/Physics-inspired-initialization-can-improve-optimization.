@@ -252,7 +252,34 @@ def run_campaign(args):
                 
                 start_time = time.time()
                 
+            # Periodic checkpoint saving and Hugging Face upload
+            if step_count % args.save_interval == 0:
+                os.makedirs("checkpoints", exist_ok=True)
+                checkpoint_path = f"checkpoints/pssa_llm_kaggle_step_{step_count}.pth"
+                torch.save(
+                    model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
+                    checkpoint_path
+                )
+                print(f"💾 Checkpoint saved locally at step {step_count}")
+                
+                if args.hf_repo and args.hf_token:
+                    try:
+                        from huggingface_hub import HfApi
+                        api = HfApi()
+                        print(f"📡 Uploading checkpoint to Hugging Face repository '{args.hf_repo}' at step {step_count}...", flush=True)
+                        api.upload_file(
+                            path_or_fileobj=checkpoint_path,
+                            path_in_repo=f"pssa_llm_kaggle_step_{step_count}.pth",
+                            repo_id=args.hf_repo,
+                            repo_type="model",
+                            token=args.hf_token
+                        )
+                        print("✅ Checkpoint upload complete!", flush=True)
+                    except Exception as e:
+                        print(f"[HF WARNING] Failed to upload checkpoint at step {step_count}: {e}", flush=True)
+                        
     # 5. Generate plots
+
     print("\nTraining completed! Compiling figures...")
     os.makedirs("results", exist_ok=True)
     
@@ -278,11 +305,29 @@ def run_campaign(args):
     
     # Save checkpoint
     os.makedirs("checkpoints", exist_ok=True)
+    checkpoint_path = "checkpoints/pssa_llm_kaggle.pth"
     torch.save(
         model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
-        "checkpoints/pssa_llm_kaggle.pth"
+        checkpoint_path
     )
-    print("Model saved to checkpoints/pssa_llm_kaggle.pth")
+    print(f"Model saved to {checkpoint_path}")
+    
+    # Upload to Hugging Face
+    if args.hf_repo and args.hf_token:
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi()
+            print(f"📡 Uploading final checkpoint to Hugging Face repository '{args.hf_repo}'...", flush=True)
+            api.upload_file(
+                path_or_fileobj=checkpoint_path,
+                path_in_repo="pssa_llm_kaggle.pth",
+                repo_id=args.hf_repo,
+                repo_type="model",
+                token=args.hf_token
+            )
+            print("✅ Final Hugging Face upload complete!", flush=True)
+        except Exception as e:
+            print(f"[HF WARNING] Failed to upload final checkpoint: {e}", flush=True)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PSSA-LM Kaggle Training")
@@ -295,6 +340,9 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
     parser.add_argument("--lambda_decorr", type=float, default=0.2, help="Slot decorrelation weight")
     parser.add_argument("--log_interval", type=int, default=25, help="Logging steps interval")
+    parser.add_argument("--save_interval", type=int, default=100, help="Steps interval to save and upload checkpoints")
+    parser.add_argument("--hf_repo", type=str, default=None, help="Hugging Face repository ID")
+    parser.add_argument("--hf_token", type=str, default=None, help="Hugging Face API token")
     parser.add_argument("--verify_only", action="store_true", help="If set, runs tiny verification run")
     
     args = parser.parse_args()
@@ -309,3 +357,4 @@ if __name__ == "__main__":
         args.log_interval = 1
         
     run_campaign(args)
+
