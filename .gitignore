@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ipynb_checkpoints/
+checkpoints/
+data/
+results/
+results_*.json
+*.pth
+*.log
+.DS_Store

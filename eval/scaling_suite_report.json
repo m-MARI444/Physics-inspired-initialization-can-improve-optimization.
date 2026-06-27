@@ -1,0 +1,19 @@
+{
+    "densification": {
+        "passed": true,
+        "peak_ignition": 0.015625,
+        "active_edges": 2.0
+    },
+    "coalition_poisoning": {
+        "passed": true,
+        "trust_divergence": 0.07423064112663269
+    },
+    "long_horizon_persistence": {
+        "passed": true,
+        "final_scope_norm": 3.060673952102661
+    },
+    "chronic_drift": {
+        "passed": true,
+        "paradigm_pressure": 0.11181434988975525
+    }
+}

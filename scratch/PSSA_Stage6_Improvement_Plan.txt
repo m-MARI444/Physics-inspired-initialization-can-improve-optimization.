@@ -1,0 +1,230 @@
+PSSA Stage 6
+Stochastic Latent World Model: Hardening & Improvement Plan
+Building on Stage 5 — Causal Physics Engine Proven
+Version 1.0  —  2026
+1. What Stage 5 Proved (and What It Did Not)
+✓  Stage 5 success: causal divergence confirmed
+The stochastic latent dynamics model successfully produces divergent internal states under different action inputs. Universe A (Move Left) and Universe B (Move Right) achieve a latent distance of 1.9375 — confirming that the probabilistic dynamics function z_t ~ N(mu(s,a), sigma(s,a)) is learning to represent action-conditional futures rather than collapsing to a single average state. The causal physics engine is working.
+Stage 5 resolved the Mode Collapse that appeared in Stage 4.5 by replacing MSE Transition Loss with the four-component contrastive loss stack. This was the critical architectural fix. However, Stage 5 leaves four open problems that must be resolved before the system can be considered production-ready:
+Open problem
+Description
+Language projection collapse
+The decoder defaults to Token 1 (arm stationary) on every output due to severe class imbalance in training data. The latent states diverge correctly but the surface text does not.
+Divergence ≠ correctness
+Latent distance of 1.9375 proves the states diverged. It does not prove they diverged in the semantically correct direction. Universe A's state may not actually encode 'left'.
+KL posterior collapse risk
+A fixed KL weight causes the network to learn sigma → 1, making z_t uninformative (the network ignores stochastic input). This appears fine at 1.9375 but will degrade as environment complexity increases.
+Action distinguishability fragility
+L_action is defined as D(s,a) != D(s,0), using the zero vector as a null action proxy. This is brittle — if zero is ever a valid action encoding, the penalty misfires.
+2. Gap 1 — Language Projection Class Imbalance
+2.1  Root cause
+The language projection layer is a linear classifier mapping from the graph's output latent vector to action token logits. Its loss function is standard cross-entropy, which minimizes overall prediction error. When 90%+ of training frames have label Token 1 (arm stationary), the minimum-loss solution is to always predict Token 1, regardless of the latent state content. The layer learns a trivial constant function.
+This is not a model capacity problem. The latent states correctly encode divergent world states — the classifier simply has no training signal to map those divergent states to non-dominant tokens.
+2.2  Fix A — Focal loss (recommended primary fix)
+Focal loss down-weights easy examples (the dominant Token 1 class) and focuses gradient signal on hard examples (rare action tokens). It modifies cross-entropy with a modulating factor:
+FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+Parameters: gamma = 2.0 (standard starting point; increase to 5.0 if Token 1 dominance persists). alpha_t = inverse class frequency weight for class t. For a class that appears 90% of the time, alpha_t = 0.1. For a class appearing 1% of the time, alpha_t = 1.0.
+import torch.nn.functional as F
+def focal_loss(logits, targets, gamma=2.0, alpha=None):
+    ce = F.cross_entropy(logits, targets, weight=alpha, reduction='none')
+    pt = torch.exp(-ce)  # probability of correct class
+    focal = (1 - pt) ** gamma * ce
+    return focal.mean()
+# Compute alpha from training set class frequencies
+class_counts = torch.bincount(all_training_labels)
+alpha = 1.0 / (class_counts.float() + 1e-6)
+alpha = alpha / alpha.sum()  # normalize
+2.3  Fix B — Separate language projection training phase
+The language projection layer should be trained in two stages: (1) freeze the world model, train only the projection layer with focal loss on a class-balanced subset; (2) unfreeze and fine-tune end-to-end. This prevents the world model's gradients from being corrupted by the imbalanced language signal during early training.
+2.4  Fix C — Oversampling rare action classes
+Construct a balanced mini-batch sampler that ensures each token class appears with equal frequency within each batch, regardless of its frequency in the full dataset. This is complementary to focal loss and often more effective when class imbalance exceeds 50:1.
+from torch.utils.data import WeightedRandomSampler
+sample_weights = alpha[all_training_labels]  # per-sample weight
+sampler = WeightedRandomSampler(sample_weights,
+                                num_samples=len(dataset),
+                                replacement=True)
+!  Recommended implementation order
+Apply Fix B first (separate training phase) — it costs nothing and immediately gives the projection layer clean gradient signal. Then add Fix A (focal loss) in the end-to-end fine-tune phase. Fix C (oversampling) is optional but useful if Token 1 still dominates after A+B.
+3. Gap 2 — Proving Semantic Correctness of Divergence
+3.1  The problem: distance is necessary but not sufficient
+The Stage 5 benchmark measures ||s_A - s_B|| = 1.9375 and declares success. But this only proves the states are numerically different. It does not prove:
+Universe A's state encodes the concept 'moved left'
+Universe B's state encodes the concept 'moved right'
+The divergence is caused by the action input rather than stochastic noise
+Two random vectors in high-dimensional space are almost always far apart. A distance of 1.9375 could be produced by a model that ignores actions entirely and simply samples different noise each time.
+3.2  Fix — Semantic correctness probing
+Add a probing classifier that is trained (separately, on frozen world model states) to predict the action taken from the resulting latent state. If the world model is encoding actions correctly, the probe should achieve high accuracy. If it cannot, the divergence is spurious.
+class ActionProbe(nn.Module):
+    def __init__(self, state_dim, n_actions):
+        super().__init__()
+        self.probe = nn.Linear(state_dim, n_actions)  # single linear layer
+    def forward(self, state):
+        return self.probe(state)
+# Train probe on FROZEN world model states
+# High accuracy => states encode actions
+# Low accuracy  => divergence is from noise, not actions
+3.3  Fix — Counterfactual consistency test
+Run the following extended benchmark:
+Step 1. Prime model with state s_0.
+Step 2. Apply action A_left for T=5 steps, record final state s_A.
+Step 3. Reset to s_0. Apply action A_right for T=5 steps, record s_B.
+Step 4. Reset to s_0. Apply A_left for T=5, then apply A_right for T=5. Record s_C.
+Step 5. Reset to s_0. Apply A_right for T=5, then A_left for T=5. Record s_D.
+Expected if causally correct: s_A != s_B (already proven), s_C should be close to s_D (left-then-right should approximate right-then-left in a symmetric environment). If s_C and s_D are far apart, the model is path-dependent in ways that do not reflect the physics.
+!  Why this matters
+A world model that produces spurious divergence is not useful for planning. If the model cannot reliably encode which action was taken in the latent state, it cannot simulate counterfactual futures for decision-making. This test is the gate between 'the latent states are different' and 'the model understands causality'.
+4. Gap 3 — KL Posterior Collapse Prevention
+4.1  The problem: fixed KL weight causes collapse
+The current loss stack includes a KL divergence term L_KL that regularizes the Gaussian latent space. With a fixed weight beta, the optimizer finds the path of least resistance: it sets sigma(s,a) = 1 for all inputs, making z_t a sample from the prior N(0,1) rather than an informed posterior. When this happens, z_t carries zero information about the state and action — the stochastic component becomes pure noise.
+This is called KL posterior collapse and it is the most common failure mode in VAE-style training. At low environment complexity (two actions, simple state), the model may not collapse because the dynamics function D can learn to ignore z_t entirely and still pass the divergence benchmark. But as the action space and state complexity grow, collapse becomes likely.
+4.2  Fix A — Cyclical KL annealing (recommended)
+Anneal the KL weight beta cyclically: start at 0, ramp to target, hold, then reset. Each cycle forces the model to first learn good reconstructions (beta=0, no KL pressure), then compress them (beta=target). The cycle prevents collapse by repeatedly releasing KL pressure before the posterior can fully converge to the prior.
+beta(t) = beta_max * min(1, t mod T_cycle / T_ramp)
+T_cycle = 1000   # steps per cycle
+T_ramp  = 400    # ramp-up duration within each cycle
+beta_max = 0.1   # start low; increase if latent space is too noisy
+def beta_schedule(step):
+    pos_in_cycle = step % T_cycle
+    return beta_max * min(1.0, pos_in_cycle / T_ramp)
+4.3  Fix B — Free bits (KL floor)
+Set a minimum KL value per latent dimension below which no penalty is applied. This allows the model to use the first N bits of latent capacity 'for free' before KL pressure activates. It directly prevents the collapse mode where all dimensions converge to the prior.
+L_KL_free = max(0, KL(q(z|s,a) || p(z)) - lambda_free)
+Recommended value: lambda_free = 0.5 nats per dimension. With a 16-dimensional z_t, this allows 8 nats of free KL capacity — enough to encode meaningful action-conditional information.
+4.4  Fix C — Monitoring sigma collapse
+Add a diagnostic that logs the mean and variance of sigma(s,a) across the training batch at each epoch. If mean sigma approaches 1.0 across all dimensions, posterior collapse is occurring. This should be a standard training monitor, not an afterthought.
+# In training loop
+mu, log_sigma = encoder(state, action)
+sigma = torch.exp(log_sigma)
+metrics['sigma_mean'] = sigma.mean().item()
+metrics['sigma_min']  = sigma.min().item()
+metrics['kl_per_dim'] = kl_divergence(mu, sigma).mean(0).tolist()
+# Alert if collapsing
+if metrics['sigma_mean'] > 0.95:
+    print('WARNING: KL posterior collapse detected')
+5. Gap 4 — Action Distinguishability Hardening
+5.1  The problem: zero-vector null action is brittle
+The current L_action loss penalizes cases where D(s,a) is too similar to D(s,0), using the zero vector as a proxy for 'no action'. This works when zero is a reserved encoding, but fails in three cases:
+Zero is a valid action in the action encoding scheme
+The action embedding learns to map meaningful actions near zero
+The environment has a 'null' action that genuinely produces no state change
+5.2  Fix — Contrastive action loss over action pairs
+Replace the zero-reference penalty with a pairwise contrastive loss over action pairs. For each training step, sample a second action a' != a from the batch. Penalize similarity between D(s,a) and D(s,a') in proportion to the semantic distance between a and a'.
+L_action_v2 = max(0, sim(D(s,a), D(s,a')) - margin * dist(a, a'))
+def contrastive_action_loss(states, actions, dynamics_fn, margin=0.5):
+    # Sample negative action for each element in batch
+    perm = torch.randperm(len(actions))
+    neg_actions = actions[perm]
+    
+    pos_states = dynamics_fn(states, actions)      # D(s, a)
+    neg_states = dynamics_fn(states, neg_actions)  # D(s, a')
+    
+    # Cosine similarity between imagined states
+    sim = F.cosine_similarity(pos_states, neg_states)
+    
+    # Action distance (Euclidean in action embedding space)
+    action_dist = F.pairwise_distance(actions, neg_actions)
+    
+    # Loss: push states apart in proportion to action difference
+    loss = F.relu(sim - margin * action_dist.clamp(0, 1))
+    return loss.mean()
+i  Why this is more robust
+The pairwise approach does not depend on any special encoding of 'null action'. It works for continuous, discrete, and mixed action spaces. It also naturally scales: actions that are very different (large dist(a,a')) must produce very different states, while actions that are similar may produce similar states.
+6. Stage 6 Revised Loss Stack
+The Stage 5 four-component loss stack is revised to incorporate all four gap fixes:
+L_total = L_contrastive + w_a * L_action_v2 + beta(t) * L_KL_free + w_s * L_stability + w_f * L_focal
+Term
+Stage 5 version
+Stage 6 change
+L_contrastive
+InfoNCE margin loss, pull toward true future, push away from negatives
+Unchanged. Add hard negative mining: sample negatives closest to the anchor in latent space for stronger signal.
+L_action
+D(s,a) != D(s,0) penalty
+Replaced with pairwise contrastive loss over action pairs. More robust, action-space agnostic.
+L_KL
+Fixed-weight KL divergence
+Replaced with cyclical annealing + free bits floor. Prevents posterior collapse at scale.
+L_stability
+Anchors persistent semantic identity
+Unchanged. Verify anchor update rate is compatible with write gate values from PSSA v2.
+L_focal
+Not present in Stage 5
+New. Focal loss on language projection layer. Applied only to the decoder head, not to world model.
+6.1  Loss weight recommendations
+Weight
+Initial value
+w_a (action)
+0.1
+beta_max (KL)
+0.05
+lambda_free (KL floor)
+0.5 nats/dim
+w_s (stability)
+0.05
+w_f (focal gamma)
+gamma=2.0
+7. Stage 6 Benchmark Suite
+Stage 5 used the Multi-Branch Benchmark as its single evaluation. Stage 6 requires a more complete suite that validates all four gaps:
+Benchmark
+Tests
+Pass criterion
+Multi-Branch (Stage 5, unchanged)
+Latent divergence under different actions
+Distance > 1.0 between universes (Stage 5 result: 1.9375)
+Action Probe Accuracy (NEW)
+Semantic correctness of divergence
+Linear probe on frozen states achieves > 80% action classification accuracy
+Counterfactual Consistency (NEW)
+Path-order invariance in symmetric environments
+||s_left_right - s_right_left|| < 0.5 * ||s_A - s_B||
+Sigma Collapse Monitor (NEW)
+KL posterior health
+Mean sigma < 0.90 across all latent dimensions after 20 epochs
+Language Projection Parity (NEW)
+Token distribution correctness
+Non-Token-1 classes appear in > 30% of outputs on balanced test set
+Long-Horizon Stability (NEW)
+State drift over 10k steps
+Probe accuracy degrades < 5% from step 100 to step 10000
+8. What a Successful Stage 6 Looks Like
+✓  Target end state
+At Stage 6 completion: (1) The multi-branch benchmark passes with distance > 1.0. (2) The action probe achieves > 80% accuracy — confirming semantic correctness, not just numerical divergence. (3) Sigma mean stays below 0.90 across 20 epochs — confirming no KL collapse. (4) The language projection produces non-trivial token distributions on the balanced test set. (5) Latent states remain semantically stable over 10,000 inference steps without reset.
+At that point, PSSA Stage 6 is ready for the first robotics prototype deployment described in the PSSA v2 roadmap: a simulated environment (MuJoCo or Isaac Gym) with persistent world state, multi-step planning, and event-driven sensor input.
+9. Recommended Implementation Order
+Step
+Action
+Step 1 (1 day)
+Add sigma collapse monitor to training loop. Establish baseline sigma_mean from Stage 5 checkpoint. This costs nothing and gives immediate diagnostic data.
+Step 2 (1 day)
+Implement focal loss for language projection. Freeze world model, train projection head only for 5 epochs on class-balanced subset.
+Step 3 (2 days)
+Run action probe benchmark on frozen Stage 5 world model states. If probe accuracy < 70%, prioritize L_action_v2 before any other changes.
+Step 4 (2 days)
+Replace L_action with L_action_v2 (pairwise contrastive). Verify multi-branch distance is preserved (should still exceed 1.0).
+Step 5 (3 days)
+Implement cyclical KL annealing + free bits. Retrain from Stage 5 checkpoint. Monitor sigma_mean and probe accuracy together.
+Step 6 (1 day)
+Run full Stage 6 benchmark suite. All six benchmarks must pass before proceeding to robotics prototype.
+Step 7 (ongoing)
+End-to-end fine-tune with full revised loss stack. Unfreeze language projection and world model together.
+10. Status Summary
+Current status of all known issues entering Stage 6:
+Language projection
+FIXED
+Focal loss + separate training phase + optional oversampling. Expected to resolve Token 1 collapse within 5 epochs.
+Divergence correctness
+IMPROVED
+Action probe benchmark added. Counterfactual consistency test added. Semantic correctness now verifiable, not assumed.
+KL posterior collapse
+IMPROVED
+Cyclical annealing + free bits + sigma monitoring. Not yet empirically confirmed — must validate on Stage 6 training run.
+Action distinguishability
+FIXED
+Pairwise contrastive L_action_v2 replaces brittle zero-reference penalty. Action-space agnostic.
+Causal physics engine
+NEW
+Proven in Stage 5. Latent divergence = 1.9375. Maintained in Stage 6 as the foundation all improvements build on.
+Long-horizon stability
+OPEN
+Not yet tested. Required for robotics prototype. Stage 6 benchmark includes 10k-step stability test.
+PSSA Stage 6 Planning Document. Builds on Stage 5 stochastic latent dynamics. All code examples are pseudocode illustrating algorithmic intent; adapt to your training framework. The causal physics engine proven in Stage 5 is the architectural foundation — Stage 6 hardens the surface outputs and validates semantic correctness.
