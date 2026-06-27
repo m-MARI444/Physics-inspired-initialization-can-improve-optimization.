@@ -102,7 +102,10 @@ def evaluate_babi_accuracy(model, tokenizer, device, num_tests=200, print_sample
             pred_id = torch.argmax(last_logits, dim=-1).item()
             pred_word = tokenizer.decode([pred_id]).strip().lower()
             
-            is_correct = (pred_word == answer.lower())
+            # Match by target token ID to align with first-token training
+            target_id = tokenizer.encode(answer)[0]
+            is_correct = (pred_id == target_id)
+            
             if is_correct:
                 correct += 1
                 
