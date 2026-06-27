@@ -321,6 +321,8 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         history["train_acc"].append(epoch_acc)
         history["test_loss"].append(test_loss)
         history["test_acc"].append(test_acc)
+        # Print progress in real-time
+        print(f"      Epoch {epoch+1:2d}/{num_epochs:2d} | Train Loss: {epoch_loss:.4f} | Train Acc: {epoch_acc:.4f} | Test Acc: {test_acc:.4f}", end='\r' if epoch < num_epochs-1 else '\n')
     return history
 
 def get_effective_rank(singular_values_dict):
