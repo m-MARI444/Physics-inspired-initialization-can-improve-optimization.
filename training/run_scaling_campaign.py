@@ -388,6 +388,10 @@ def run_campaign():
     backend = "ddp"
     hf_repo = None
     hf_token = None
+    d_model = 192
+    num_layers = 6
+    num_slots = 8
+    max_steps = 50000
     for arg in sys.argv:
         if arg.startswith("--batch_size="):
             batch_size = int(arg.split("=")[1])
@@ -401,6 +405,14 @@ def run_campaign():
             hf_repo = arg.split("=")[1].strip()
         elif arg.startswith("--hf_token="):
             hf_token = arg.split("=")[1].strip()
+        elif arg.startswith("--d_model="):
+            d_model = int(arg.split("=")[1])
+        elif arg.startswith("--num_layers="):
+            num_layers = int(arg.split("=")[1])
+        elif arg.startswith("--num_slots="):
+            num_slots = int(arg.split("=")[1])
+        elif arg.startswith("--max_steps="):
+            max_steps = int(arg.split("=")[1])
 
     if global_rank == 0:
         print(f"🚀 Starting Scientific Mapping Campaign on {device} (Backend={backend}, DDP={is_ddp})")
@@ -463,12 +475,21 @@ def run_campaign():
             checkpoint_corrupted = True
 
     # ── Step 2: NOW load model and checkpoint onto GPU ─────────────────────────
-    d_model = 192
-    num_layers = 6
-    num_slots = 8
+    # (d_model, num_layers, and num_slots are parsed dynamically from sys.argv)
     
     if global_rank == 0:
-        print(f"Initializing 100M Parameter PSSA Model...")
+        # Dynamically measure parameter count
+        test_m = PSSAGPT(
+            vocab_size=vocab_size,
+            d_model=d_model,
+            num_slots=num_slots,
+            tau=0.15,
+            num_scopes=3,
+            num_layers=num_layers
+        )
+        total_params = sum(p.numel() for p in test_m.parameters())
+        print(f"Initializing PSSA Model with size: {total_params / 1e6:.2f} Million Parameters (d_model={d_model}, layers={num_layers}, slots={num_slots})...")
+        del test_m
     model = PSSAGPT(
         vocab_size=vocab_size, 
         d_model=d_model, 
@@ -749,7 +770,7 @@ def run_campaign():
     # At ~3-5 sec/step after torch.compile: 25,000 × 4s = 100,000 sec ≈ 27 hours.
     # This fits within the 26-hour Kaggle free-session window.
     # The model at step 50K (Phase 3 GROKKING complete) is a fully trained, usable model.
-    TARGET_STEPS = 50000
+    TARGET_STEPS = max_steps
     ema_dt = None
     
     loss_val = 0.0
