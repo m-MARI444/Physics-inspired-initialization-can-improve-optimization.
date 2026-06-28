@@ -402,6 +402,10 @@ def run_relational_distillation(model, teacher_name, get_batch_fn, device, hf_to
         # Get next batch
         input_ids, targets = get_batch_fn()
         
+        # Slice sequence length to 16 to reduce recurrent loop overhead (20s/it -> 5s/it)
+        input_ids = input_ids[:, :16]
+        targets = targets[:, :16]
+        
         # Forward pass teacher
         with torch.no_grad():
             outputs_t = teacher(input_ids, output_attentions=True, output_hidden_states=True)
