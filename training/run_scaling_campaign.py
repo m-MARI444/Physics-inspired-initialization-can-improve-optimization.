@@ -368,7 +368,11 @@ def run_relational_distillation(model, teacher_name, get_batch_fn, device, hf_to
     
     # 1. Load teacher model
     try:
-        teacher = GPT2LMHeadModel.from_pretrained(teacher_name, token=hf_token).to(device)
+        teacher = GPT2LMHeadModel.from_pretrained(
+            teacher_name, 
+            token=hf_token, 
+            attn_implementation="eager"
+        ).to(device)
         teacher.eval()
     except Exception as e:
         if global_rank == 0:
