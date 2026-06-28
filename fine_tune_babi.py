@@ -11,8 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
-# Import model definition dynamically from our local training module
-from kaggle_pssa_llm import PSSALanguageModel
+# Models will be imported dynamically in main() based on selected architecture type
 
 # ==========================================
 # 1. Synthetic bAbI Task 1 Generator
@@ -133,6 +132,10 @@ def main():
                         help="Number of fine-tuning epochs")
     parser.add_argument("--lr", type=float, default=2e-4,
                         help="Learning rate for fine-tuning")
+    parser.add_argument("--model_type", type=str, default="llm", choices=["llm", "gpt"],
+                        help="Architecture type: 'llm' for simplified model, 'gpt' for full PSSA-GPT model")
+    parser.add_argument("--num_layers", type=int, default=6,
+                        help="Number of layers (only used for full PSSA-GPT model)")
     args = parser.parse_args()
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -147,9 +150,28 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     vocab_size = len(tokenizer)
     
-    model = PSSALanguageModel(vocab_size=vocab_size, d_model=args.d_model, num_slots=args.num_slots)
-    
-    state_dict = torch.load(args.checkpoint, map_location=device)
+    if args.model_type == "llm":
+        from kaggle_pssa_llm import PSSALanguageModel
+        model = PSSALanguageModel(vocab_size=vocab_size, d_model=args.d_model, num_slots=args.num_slots)
+    else:
+        from model.pssa_gpt import PSSAGPT
+        model = PSSAGPT(
+            vocab_size=vocab_size,
+            d_model=args.d_model,
+            num_slots=args.num_slots,
+            tau=0.15,
+            num_scopes=3,
+            num_layers=args.num_layers
+        )
+        
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    else:
+        state_dict = checkpoint
+        
     new_state_dict = {}
     for k, v in state_dict.items():
         if k.startswith("module."):
