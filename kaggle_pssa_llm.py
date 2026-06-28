@@ -240,15 +240,25 @@ def run_campaign(args):
                 
                 # Check if we should download it
                 local_step_path = os.path.join(checkpoint_dir, latest_file)
+                root_step_path = latest_file
+                if os.path.exists(root_step_path) and not os.path.exists(local_step_path):
+                    print(f"🔄 Moving root checkpoint '{root_step_path}' to '{local_step_path}'...")
+                    os.rename(root_step_path, local_step_path)
+                    
                 if not os.path.exists(local_step_path):
                     print(f"📡 Downloading '{latest_file}'...")
-                    hf_hub_download(repo_id=args.hf_repo, filename=latest_file, token=args.hf_token, local_dir=".")
+                    hf_hub_download(repo_id=args.hf_repo, filename=latest_file, token=args.hf_token, local_dir="checkpoints")
                 checkpoint_path = local_step_path
             else:
                 # Fallback to default name
+                root_fallback_path = "pssa_llm_kaggle.pth"
+                if os.path.exists(root_fallback_path) and not os.path.exists(checkpoint_path):
+                    print(f"🔄 Moving root checkpoint '{root_fallback_path}' to '{checkpoint_path}'...")
+                    os.rename(root_fallback_path, checkpoint_path)
+                    
                 if not os.path.exists(checkpoint_path):
                     print(f"📡 Downloading 'pssa_llm_kaggle.pth' from Hugging Face...")
-                    hf_hub_download(repo_id=args.hf_repo, filename="pssa_llm_kaggle.pth", token=args.hf_token, local_dir=".")
+                    hf_hub_download(repo_id=args.hf_repo, filename="pssa_llm_kaggle.pth", token=args.hf_token, local_dir="checkpoints")
         except Exception as e:
             print(f"[HF WARNING] Failed to scan or download from Hugging Face: {e}")
             
