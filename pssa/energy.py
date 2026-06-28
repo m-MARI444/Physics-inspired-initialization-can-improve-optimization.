@@ -40,8 +40,9 @@ def compute_connection_energy(model, eta=1e-4, beta=1e-3):
             # 1. L2 norm penalty (kinetic weight resistance)
             loss += 0.5 * eta * torch.sum(w ** 2)
             
-            # 2. Row decorrelation (orthogonality of neuronal weight vectors)
-            if w.size(0) > 1:
+            # 2. Row decorrelation (orthogonality of routing/dense neuronal weight vectors)
+            # Exclude massive layers like embedding or language heads to avoid OOM (e.g. 50257 x 50257 correlation matrices)
+            if w.size(0) > 1 and w.size(0) <= 2048 and not any(k in name for k in ['embed', 'out_proj']):
                 # Normalize rows to unit vectors
                 row_norms = torch.norm(w, dim=1, keepdim=True) + 1e-8
                 w_norm = w / row_norms
