@@ -188,44 +188,11 @@ def run_campaign(args):
         
     model = model.to(device)
     
-    # 3.5 Auto-Resume from Checkpoint
-    checkpoint_dir = "checkpoints"
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    checkpoint_path = os.path.join(checkpoint_dir, "pssa_llm_kaggle.pth")
-    
-    # Try downloading from Hugging Face if not found locally but credentials are provided
-    if not os.path.exists(checkpoint_path) and args.hf_repo and args.hf_token:
-        try:
-            from huggingface_hub import hf_hub_download
-            print(f"📡 Downloading latest checkpoint from Hugging Face repository '{args.hf_repo}'...")
-            hf_hub_download(repo_id=args.hf_repo, filename="pssa_llm_kaggle.pth", token=args.hf_token, local_dir=".")
-            print("✅ Checkpoint downloaded successfully.")
-        except Exception as e:
-            print(f"[HF WARNING] Failed to download checkpoint from Hugging Face: {e}")
-            
-    if os.path.exists(checkpoint_path):
-        print(f"🔄 Found existing checkpoint at '{checkpoint_path}'. Resuming training...")
-        try:
-            state_dict = torch.load(checkpoint_path, map_location=device)
-            # Handle state_dict keys for nn.DataParallel wrapping differences
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                if k.startswith("module.") and not isinstance(model, nn.DataParallel):
-                    new_state_dict[k[7:]] = v
-                elif not k.startswith("module.") and isinstance(model, nn.DataParallel):
-                    new_state_dict[f"module.{k}"] = v
-                else:
-                    new_state_dict[k] = v
-            model.load_state_dict(new_state_dict)
-            print("✅ Checkpoint weights loaded successfully.")
-        except Exception as e:
-            print(f"Warning: Failed to load checkpoint weights: {e}")
-    
     # Calculate parameter count
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model Parameters: {total_params / 1e6:.2f} Million")
     
-    # 4. Optimizer & Scaler
+    # 4. Optimizer & Scaler Setup
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == "cuda"))
     
@@ -239,6 +206,65 @@ def run_campaign(args):
     }
     
     step_count = 0
+    if args.start_step is not None:
+        step_count = args.start_step
+        print(f"Set manual starting step count: {step_count}")
+        
+    # 3.5 Auto-Resume from Checkpoint (Full State)
+    checkpoint_dir = "checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, "pssa_llm_kaggle.pth")
+    
+    if not os.path.exists(checkpoint_path) and args.hf_repo and args.hf_token:
+        try:
+            from huggingface_hub import hf_hub_download
+            print(f"📡 Downloading latest checkpoint from Hugging Face repository '{args.hf_repo}'...")
+            hf_hub_download(repo_id=args.hf_repo, filename="pssa_llm_kaggle.pth", token=args.hf_token, local_dir=".")
+            print("✅ Checkpoint downloaded successfully.")
+        except Exception as e:
+            print(f"[HF WARNING] Failed to download checkpoint from Hugging Face: {e}")
+            
+    if os.path.exists(checkpoint_path):
+        print(f"🔄 Found existing checkpoint at '{checkpoint_path}'. Resuming training...")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                state_dict = checkpoint["model_state_dict"]
+                if args.start_step is None:
+                    step_count = checkpoint.get("step", 0)
+                history = checkpoint.get("history", history)
+                print(f"Loaded checkpoint at step {step_count}")
+                # Load optimizer state dict if present
+                if "optimizer_state_dict" in checkpoint and optimizer is not None:
+                    try:
+                        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                        print("✅ Loaded optimizer state.")
+                    except Exception as opt_err:
+                        print(f"Warning: Could not load optimizer state: {opt_err}")
+                # Load scaler state dict if present
+                if "scaler_state_dict" in checkpoint and checkpoint["scaler_state_dict"] is not None and scaler is not None:
+                    try:
+                        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+                        print("✅ Loaded grad scaler state.")
+                    except Exception as scaler_err:
+                        print(f"Warning: Could not load grad scaler state: {scaler_err}")
+            else:
+                state_dict = checkpoint
+                print("Loaded checkpoint weights (no step metadata present).")
+                
+            # Handle state_dict keys for nn.DataParallel wrapping differences
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith("module.") and not isinstance(model, nn.DataParallel):
+                    new_state_dict[k[7:]] = v
+                elif not k.startswith("module.") and isinstance(model, nn.DataParallel):
+                    new_state_dict[f"module.{k}"] = v
+                else:
+                    new_state_dict[k] = v
+            model.load_state_dict(new_state_dict)
+            print("✅ Checkpoint weights loaded successfully.")
+        except Exception as e:
+            print(f"Warning: Failed to load checkpoint weights: {e}")
     start_time = time.time()
     
     print("\n--- Starting PSSA-LM Training Campaign ---")
@@ -320,10 +346,14 @@ def run_campaign(args):
             if step_count % args.save_interval == 0:
                 os.makedirs("checkpoints", exist_ok=True)
                 checkpoint_path = f"checkpoints/pssa_llm_kaggle_step_{step_count}.pth"
-                torch.save(
-                    model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
-                    checkpoint_path
-                )
+                checkpoint_dict = {
+                    "step": step_count,
+                    "model_state_dict": model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict() if scaler else None,
+                    "history": history
+                }
+                torch.save(checkpoint_dict, checkpoint_path)
                 print(f"💾 Checkpoint saved locally at step {step_count}")
                 
                 if args.hf_repo and args.hf_token:
@@ -370,10 +400,14 @@ def run_campaign(args):
     # Save checkpoint
     os.makedirs("checkpoints", exist_ok=True)
     checkpoint_path = "checkpoints/pssa_llm_kaggle.pth"
-    torch.save(
-        model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
-        checkpoint_path
-    )
+    checkpoint_dict = {
+        "step": step_count,
+        "model_state_dict": model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict() if scaler else None,
+        "history": history
+    }
+    torch.save(checkpoint_dict, checkpoint_path)
     print(f"Model saved to {checkpoint_path}")
     
     # Upload to Hugging Face
@@ -408,6 +442,7 @@ if __name__ == "__main__":
     parser.add_argument("--hf_repo", type=str, default=None, help="Hugging Face repository ID")
     parser.add_argument("--hf_token", type=str, default=None, help="Hugging Face API token")
     parser.add_argument("--dataset", type=str, default="wikitext", choices=["wikitext", "fineweb-edu"], help="Dataset to train on")
+    parser.add_argument("--start_step", type=int, default=None, help="Manually override starting step count")
     parser.add_argument("--verify_only", action="store_true", help="If set, runs tiny verification run")
     
     args = parser.parse_args()
