@@ -419,6 +419,16 @@ def run_campaign(args):
                     except Exception as e:
                         print(f"[HF WARNING] Failed to upload checkpoint at step {step_count}: {e}", flush=True)
                         
+                # Delete the previous step checkpoint to save disk space
+                prev_step = step_count - args.save_interval
+                prev_checkpoint_path = f"checkpoints/pssa_llm_kaggle_step_{prev_step}.pth"
+                if os.path.exists(prev_checkpoint_path):
+                    try:
+                        os.remove(prev_checkpoint_path)
+                        print(f"🗑️ Cleaned up old local checkpoint: {prev_checkpoint_path}")
+                    except Exception as clean_err:
+                        print(f"Warning: Failed to clean up old checkpoint: {clean_err}")
+                        
     # 5. Generate plots
 
     print("\nTraining completed! Compiling figures...")
