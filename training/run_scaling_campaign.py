@@ -361,6 +361,89 @@ def load_campaign_checkpoint(
         print(f"▶️ Loaded step={ckpt['global_step']} phase={phase}", flush=True)
     return ckpt['global_step'], ckpt.get('dataset_items_consumed', 0), ckpt.get('loss', 0.0), phase, ckpt
 
+def run_relational_distillation(model, teacher_name, get_batch_fn, device, hf_token=None, num_steps=250, global_rank=0):
+    if global_rank == 0:
+        print(f"\n🧠 Starting PSSA Relational Distillation Phase (Teacher: {teacher_name}, Steps: {num_steps})...", flush=True)
+    from transformers import GPT2LMHeadModel
+    
+    # 1. Load teacher model
+    try:
+        teacher = GPT2LMHeadModel.from_pretrained(teacher_name, token=hf_token).to(device)
+        teacher.eval()
+    except Exception as e:
+        if global_rank == 0:
+            print(f"Error loading teacher model {teacher_name}: {e}", flush=True)
+        return
+        
+    # 2. Setup distillation optimizer (only optimizing the student model)
+    raw_model = model.module if hasattr(model, 'module') else model
+    optimizer = torch.optim.AdamW(raw_model.parameters(), lr=1e-4, weight_decay=0.01)
+    
+    # 3. Import energy modules
+    from pssa.energy import compute_relational_energy, compute_connection_energy
+    
+    pbar = range(num_steps)
+    if global_rank == 0:
+        try:
+            from tqdm import tqdm
+            pbar = tqdm(pbar, desc="Distillation Warmup")
+        except ImportError:
+            pass
+            
+    raw_model.train()
+    
+    for step in pbar:
+        optimizer.zero_grad()
+        
+        # Get next batch
+        input_ids, targets = get_batch_fn()
+        
+        # Forward pass teacher
+        with torch.no_grad():
+            outputs_t = teacher(input_ids, output_attentions=True, output_hidden_states=True)
+            t_logits = outputs_t.logits
+            t_attns = outputs_t.attentions # Tuple of attention maps [batch, num_heads, T, T]
+            
+        # Forward pass student
+        s_outputs = raw_model(input_ids, return_telemetry=True)
+        s_logits = s_outputs[0]
+        s_retrievals = s_outputs[6] # [batch, T, M]
+        recon_loss = s_outputs[9]
+        
+        # Compute logit alignment (prediction energy)
+        loss_pred = F.cross_entropy(s_logits.view(-1, s_logits.size(-1)), targets.view(-1))
+        
+        # Compute relational distillation energy across layers
+        loss_relation = torch.tensor(0.0, device=device)
+        layers_count = 0
+        for l, layer in enumerate(raw_model.layers):
+            if hasattr(layer, "last_dependency") and layer.last_dependency is not None:
+                t_layer_idx = min(2 * l + 1, len(t_attns) - 1)
+                A_t = t_attns[t_layer_idx] # [batch, num_heads, T, T]
+                D_s = layer.last_dependency # [batch, M, M]
+                
+                loss_relation = loss_relation + compute_relational_energy(D_s, A_t, s_retrievals)
+                layers_count += 1
+                
+        if layers_count > 0:
+            loss_relation = loss_relation / layers_count
+            
+        # Compute physical connection energy
+        loss_conn = compute_connection_energy(raw_model, eta=1e-4, beta=1e-3)
+        
+        # Total distillation loss
+        total_loss = loss_pred + 1.0 * loss_relation + 1.0 * loss_conn + 0.1 * recon_loss
+        
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
+        optimizer.step()
+        
+        if global_rank == 0 and step % 50 == 0:
+            print(f"  [Distill Step {step:3d}] Pred={loss_pred.item():.4f} | Rel={loss_relation.item():.4f} | Conn={loss_conn.item():.4f}", flush=True)
+            
+    if global_rank == 0:
+        print("✨ PSSA Relational Distillation initialization completed successfully!\n", flush=True)
+
 def run_campaign():
     global is_paused
     torch.set_float32_matmul_precision('high')
@@ -392,6 +475,8 @@ def run_campaign():
     num_layers = 6
     num_slots = 8
     max_steps = 50000
+    distill_teacher = None
+    distill_steps = 250
     for arg in sys.argv:
         if arg.startswith("--batch_size="):
             batch_size = int(arg.split("=")[1])
@@ -413,6 +498,10 @@ def run_campaign():
             num_slots = int(arg.split("=")[1])
         elif arg.startswith("--max_steps="):
             max_steps = int(arg.split("=")[1])
+        elif arg.startswith("--distill_teacher="):
+            distill_teacher = arg.split("=")[1].strip()
+        elif arg.startswith("--distill_steps="):
+            distill_steps = int(arg.split("=")[1])
 
     if global_rank == 0:
         print(f"🚀 Starting Scientific Mapping Campaign on {device} (Backend={backend}, DDP={is_ddp})")
@@ -765,6 +854,18 @@ def run_campaign():
 
     if not sse._baseline_sr:
         sse.capture_baselines(verbose=False)
+
+    # ── Step-0 Relational Distillation Phase ───────────────────────
+    if global_step == 0 and distill_teacher:
+        run_relational_distillation(
+            model=model,
+            teacher_name=distill_teacher,
+            get_batch_fn=get_next_batch,
+            device=device,
+            hf_token=hf_token,
+            num_steps=distill_steps,
+            global_rank=global_rank
+        )
 
     # 50,000 steps total: from step 25,004 → only 25,000 more steps remain.
     # At ~3-5 sec/step after torch.compile: 25,000 × 4s = 100,000 sec ≈ 27 hours.
