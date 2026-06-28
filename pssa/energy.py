@@ -119,7 +119,34 @@ def compute_information_energy(student_activations, mu=1.0):
     return mu * (loss / count) if count > 0 else torch.tensor(0.0, device=student_activations[-1].device)
 
 
-def compute_potential_energy(student_model, student_activations, teacher_activations, config):
+def compute_relational_energy(dependency_matrix, teacher_attention_maps, allocation_probabilities):
+    """
+    Computes Relational Energy (E_relation) measuring the discrepancy between projected teacher attention
+    and student causal dependency.
+    """
+    if dependency_matrix is None or teacher_attention_maps is None or allocation_probabilities is None:
+        return torch.tensor(0.0, device=dependency_matrix.device if dependency_matrix is not None else torch.device("cpu"))
+        
+    batch_size, T, M = allocation_probabilities.shape
+    num_heads = teacher_attention_maps.shape[1]
+    
+    # Column-normalize allocation probabilities (probabilities of token t given slot m)
+    col_sums = allocation_probabilities.sum(dim=1, keepdim=True) + 1e-8
+    P_bar = allocation_probabilities / col_sums # [batch, T, M]
+    
+    total_loss = 0.0
+    for h in range(num_heads):
+        # A_h: [batch, T, T]
+        A_h = teacher_attention_maps[:, h, :, :]
+        # Project token attention to slot space: P_bar^T @ A_h @ P_bar
+        A_proj = torch.bmm(torch.bmm(P_bar.transpose(1, 2), A_h), P_bar) # [batch, M, M]
+        total_loss += torch.mean((dependency_matrix - A_proj) ** 2)
+        
+    return total_loss / num_heads
+
+
+def compute_potential_energy(student_model, student_activations, teacher_activations, config,
+                             dependency_matrix=None, teacher_attention_maps=None, allocation_probabilities=None):
     """
     Computes the total potential energy V(W) as a weighted sum of all energy terms.
     """
@@ -141,12 +168,18 @@ def compute_potential_energy(student_model, student_activations, teacher_activat
         student_activations, 
         mu=config.get('mu', 1.0)
     )
+    v_rel = compute_relational_energy(
+        dependency_matrix,
+        teacher_attention_maps,
+        allocation_probabilities
+    )
     
     total_potential = (
         config.get('lambda_pred', 1.0) * v_pred +
         config.get('lambda_conn', 1.0) * v_conn +
         config.get('lambda_stab', 1.0) * v_stab +
-        config.get('lambda_info', 1.0) * v_info
+        config.get('lambda_info', 1.0) * v_info +
+        config.get('lambda_relation', 1.0) * v_rel
     )
     
     energy_breakdown = {
@@ -154,7 +187,8 @@ def compute_potential_energy(student_model, student_activations, teacher_activat
         "v_pred": v_pred.item(),
         "v_conn": v_conn.item(),
         "v_stab": v_stab.item(),
-        "v_info": v_info.item()
+        "v_info": v_info.item(),
+        "v_relation": v_rel.item()
     }
     
     return total_potential, energy_breakdown

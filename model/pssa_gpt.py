@@ -13,6 +13,7 @@ class PSSALayer(nn.Module):
         self.routing_temp = routing_temp
         self.num_scopes = num_scopes
         self.layer_idx = layer_idx
+        self.last_dependency = None
         
         # --- LAYER-SPECIFIC INERTIA ---
         # Enforces hierarchical temporal cognition: lower = fast, top = stable
@@ -377,6 +378,7 @@ class PSSALayer(nn.Module):
         
         D_logits = torch.bmm(Q_dep, K_dep.transpose(1, 2)) / (d_dep ** 0.5)
         D = torch.sigmoid(D_logits) # [batch, 12, 12] directed dependency strength
+        self.last_dependency = D.detach() if not self.training else D
         
         # Stage 28 - Confidence-Weighted propagation attenuation & trust weighting
         source_trust = torch.sigmoid(self.w_trust(E_prev_flat)).squeeze(-1) # [batch, 12]
