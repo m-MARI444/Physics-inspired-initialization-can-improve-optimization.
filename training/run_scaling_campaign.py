@@ -379,13 +379,8 @@ def run_relational_distillation(model, teacher_name, get_batch_fn, device, hf_to
     raw_model = model.module if hasattr(model, 'module') else model
     optimizer = torch.optim.AdamW(raw_model.parameters(), lr=1e-4, weight_decay=0.01)
     
-    # Compile the model during distillation to avoid massive eager mode overhead (20s/it -> <0.5s/it)
-    if global_rank == 0:
-        print("[CAMPAIGN] Compiling PSSA student model for distillation...", flush=True)
-    distill_model = torch.compile(raw_model, mode="reduce-overhead")
-    
     # 3. Import energy modules
-    from pssa.energy import compute_relational_energy, compute_connection_energy
+    from pssa.energy import compute_relational_energy
     
     pbar = range(num_steps)
     if global_rank == 0:
@@ -395,7 +390,7 @@ def run_relational_distillation(model, teacher_name, get_batch_fn, device, hf_to
         except ImportError:
             pass
             
-    distill_model.train()
+    raw_model.train()
     
     for step in pbar:
         optimizer.zero_grad()
@@ -409,8 +404,8 @@ def run_relational_distillation(model, teacher_name, get_batch_fn, device, hf_to
             t_logits = outputs_t.logits
             t_attns = outputs_t.attentions # Tuple of attention maps [batch, num_heads, T, T]
             
-        # Forward pass student
-        s_outputs = distill_model(input_ids, return_telemetry=True)
+        # Forward pass student (run eager mode for rapid step latency)
+        s_outputs = raw_model(input_ids, return_telemetry=True)
         s_logits = s_outputs[0]
         s_retrievals = s_outputs[6] # [batch, T, M]
         recon_loss = s_outputs[9]
@@ -421,36 +416,41 @@ def run_relational_distillation(model, teacher_name, get_batch_fn, device, hf_to
         # Compute relational distillation energy across layers
         loss_relation = torch.tensor(0.0, device=device)
         layers_count = 0
+        
+        if step == 0 and global_rank == 0:
+            print(f"\n[DEBUG DISTILL] teacher_attentions count: {len(t_attns)}, layer 0 attention shape: {t_attns[0].shape}")
+            print(f"[DEBUG DISTILL] student_retrievals shape: {s_retrievals.shape}")
+            
         for l, layer in enumerate(raw_model.layers):
-            if hasattr(layer, "last_dependency") and layer.last_dependency is not None:
+            dep_matrix = getattr(layer, "last_dependency", None)
+            if step == 0 and global_rank == 0:
+                print(f"[DEBUG DISTILL] Layer {l} last_dependency type/shape: {type(dep_matrix)} / {dep_matrix.shape if dep_matrix is not None else 'None'}")
+            
+            if dep_matrix is not None:
                 t_layer_idx = min(2 * l + 1, len(t_attns) - 1)
                 A_t = t_attns[t_layer_idx] # [batch, num_heads, T, T]
-                D_s = layer.last_dependency # [batch, M, M]
                 
-                loss_relation = loss_relation + compute_relational_energy(D_s, A_t, s_retrievals)
+                loss_relation = loss_relation + compute_relational_energy(dep_matrix, A_t, s_retrievals)
                 layers_count += 1
                 
         if layers_count > 0:
             loss_relation = loss_relation / layers_count
             
-        # Compute physical connection energy
-        loss_conn = compute_connection_energy(raw_model, eta=1e-4, beta=1e-3)
-        
-        # Total distillation loss
-        total_loss = loss_pred + 1.0 * loss_relation + 1.0 * loss_conn + 0.1 * recon_loss
+        # Total distillation loss (Connection L2 regularization is handled natively by AdamW weight_decay)
+        total_loss = loss_pred + 1.0 * loss_relation + 0.1 * recon_loss
         
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
         optimizer.step()
         
         if global_rank == 0 and step % 50 == 0:
-            print(f"  [Distill Step {step:3d}] Pred={loss_pred.item():.4f} | Rel={loss_relation.item():.4f} | Conn={loss_conn.item():.4f}", flush=True)
+            print(f"  [Distill Step {step:3d}] Pred={loss_pred.item():.4f} | Rel={loss_relation.item():.4f}", flush=True)
             
     if global_rank == 0:
         print("✨ PSSA Relational Distillation initialization completed successfully!\n", flush=True)
         
-    # Free teacher and temporary compiled graph to reclaim GPU memory
-    del teacher, distill_model, optimizer
+    # Free teacher and clean up memory
+    del teacher, optimizer
     import gc
     gc.collect()
     torch.cuda.empty_cache()
