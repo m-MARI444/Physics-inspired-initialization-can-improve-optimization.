@@ -379,6 +379,11 @@ def run_relational_distillation(model, teacher_name, get_batch_fn, device, hf_to
     raw_model = model.module if hasattr(model, 'module') else model
     optimizer = torch.optim.AdamW(raw_model.parameters(), lr=1e-4, weight_decay=0.01)
     
+    # Compile the model during distillation to avoid massive eager mode overhead (20s/it -> <0.5s/it)
+    if global_rank == 0:
+        print("[CAMPAIGN] Compiling PSSA student model for distillation...", flush=True)
+    distill_model = torch.compile(raw_model, mode="reduce-overhead")
+    
     # 3. Import energy modules
     from pssa.energy import compute_relational_energy, compute_connection_energy
     
@@ -390,7 +395,7 @@ def run_relational_distillation(model, teacher_name, get_batch_fn, device, hf_to
         except ImportError:
             pass
             
-    raw_model.train()
+    distill_model.train()
     
     for step in pbar:
         optimizer.zero_grad()
@@ -405,7 +410,7 @@ def run_relational_distillation(model, teacher_name, get_batch_fn, device, hf_to
             t_attns = outputs_t.attentions # Tuple of attention maps [batch, num_heads, T, T]
             
         # Forward pass student
-        s_outputs = raw_model(input_ids, return_telemetry=True)
+        s_outputs = distill_model(input_ids, return_telemetry=True)
         s_logits = s_outputs[0]
         s_retrievals = s_outputs[6] # [batch, T, M]
         recon_loss = s_outputs[9]
@@ -443,6 +448,12 @@ def run_relational_distillation(model, teacher_name, get_batch_fn, device, hf_to
             
     if global_rank == 0:
         print("✨ PSSA Relational Distillation initialization completed successfully!\n", flush=True)
+        
+    # Free teacher and temporary compiled graph to reclaim GPU memory
+    del teacher, distill_model, optimizer
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
 
 def run_campaign():
     global is_paused
