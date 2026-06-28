@@ -159,7 +159,7 @@ def run_campaign(args):
     if args.dataset == "fineweb-edu":
         print("Initializing FineWeb-EDU streaming dataloader...")
         # Stream the 10B sample split dynamically without downloading it to disk
-        dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10B", split="train", streaming=True)
+        dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
         dataloader = stream_batches(dataset, tokenizer, args.batch_size, args.seq_len)
     else:
         print("Downloading Wikitext-2 dataset...")
@@ -248,7 +248,7 @@ def run_campaign(args):
             
         # Re-initialize generator for streaming if using fineweb-edu at the start of epoch
         if args.dataset == "fineweb-edu":
-            dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10B", split="train", streaming=True)
+            dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
             epoch_dataloader = stream_batches(dataset, tokenizer, args.batch_size, args.seq_len)
         else:
             epoch_dataloader = dataloader
