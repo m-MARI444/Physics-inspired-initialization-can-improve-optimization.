@@ -434,7 +434,8 @@ def run_relational_distillation(model, teacher_name, get_batch_fn, device, hf_to
                 t_layer_idx = min(2 * l + 1, len(t_attns) - 1)
                 A_t = t_attns[t_layer_idx] # [batch, num_heads, T, T]
                 
-                loss_relation = loss_relation + compute_relational_energy(dep_matrix, A_t, s_retrievals)
+                s_ret_sliced = s_retrievals[:, :, l, :dep_matrix.shape[1]]
+                loss_relation = loss_relation + compute_relational_energy(dep_matrix, A_t, s_ret_sliced)
                 layers_count += 1
                 
         if layers_count > 0:
