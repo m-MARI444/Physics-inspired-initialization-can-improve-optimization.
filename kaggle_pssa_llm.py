@@ -11,6 +11,24 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 from datasets import load_dataset
 
+def stream_batches(dataset, tokenizer, batch_size, seq_len):
+    current_tokens = []
+    for sample in dataset:
+        text = sample["text"]
+        if not text or len(text.strip()) == 0:
+            continue
+        tokens = tokenizer.encode(text)
+        current_tokens.extend(tokens)
+        
+        while len(current_tokens) >= batch_size * seq_len:
+            batch_data = []
+            for b in range(batch_size):
+                start = b * seq_len
+                end = start + seq_len
+                batch_data.append(current_tokens[start:end])
+            current_tokens = current_tokens[batch_size * seq_len:]
+            yield {"input_ids": torch.tensor(batch_data, dtype=torch.long)}
+
 # ==========================================
 # 1. PSSA Language Model Architecture
 # ==========================================
@@ -137,21 +155,27 @@ def run_campaign(args):
     tokenizer.pad_token = tokenizer.eos_token
     vocab_size = len(tokenizer)
     
-    # 2. Load and Prepare Dataset (Wikitext-2)
-    print("Downloading Wikitext-2 dataset...")
-    dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
-    
-    # Simple tokenization function
-    def tokenize_function(examples):
-        return tokenizer(examples["text"], truncation=True, max_length=args.seq_len, padding="max_length")
+    # 2. Load and Prepare Dataset (Dynamic)
+    if args.dataset == "fineweb-edu":
+        print("Initializing FineWeb-EDU streaming dataloader...")
+        # Stream the 10B sample split dynamically without downloading it to disk
+        dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10B", split="train", streaming=True)
+        dataloader = stream_batches(dataset, tokenizer, args.batch_size, args.seq_len)
+    else:
+        print("Downloading Wikitext-2 dataset...")
+        dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
         
-    print("Tokenizing dataset...")
-    # Filter empty lines
-    dataset = dataset.filter(lambda x: len(x["text"].strip()) > 0)
-    tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
-    tokenized_dataset.set_format(type="torch", columns=["input_ids"])
-    
-    dataloader = DataLoader(tokenized_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+        # Simple tokenization function
+        def tokenize_function(examples):
+            return tokenizer(examples["text"], truncation=True, max_length=args.seq_len, padding="max_length")
+            
+        print("Tokenizing dataset...")
+        # Filter empty lines
+        dataset = dataset.filter(lambda x: len(x["text"].strip()) > 0)
+        tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+        tokenized_dataset.set_format(type="torch", columns=["input_ids"])
+        
+        dataloader = DataLoader(tokenized_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
     
     # 3. Instantiate Model
     print(f"Initializing PSSA Language Model (d_model={args.d_model}, slots={args.num_slots})...")
@@ -163,6 +187,39 @@ def run_campaign(args):
         model = nn.DataParallel(model)
         
     model = model.to(device)
+    
+    # 3.5 Auto-Resume from Checkpoint
+    checkpoint_dir = "checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, "pssa_llm_kaggle.pth")
+    
+    # Try downloading from Hugging Face if not found locally but credentials are provided
+    if not os.path.exists(checkpoint_path) and args.hf_repo and args.hf_token:
+        try:
+            from huggingface_hub import hf_hub_download
+            print(f"📡 Downloading latest checkpoint from Hugging Face repository '{args.hf_repo}'...")
+            hf_hub_download(repo_id=args.hf_repo, filename="pssa_llm_kaggle.pth", token=args.hf_token, local_dir=".")
+            print("✅ Checkpoint downloaded successfully.")
+        except Exception as e:
+            print(f"[HF WARNING] Failed to download checkpoint from Hugging Face: {e}")
+            
+    if os.path.exists(checkpoint_path):
+        print(f"🔄 Found existing checkpoint at '{checkpoint_path}'. Resuming training...")
+        try:
+            state_dict = torch.load(checkpoint_path, map_location=device)
+            # Handle state_dict keys for nn.DataParallel wrapping differences
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith("module.") and not isinstance(model, nn.DataParallel):
+                    new_state_dict[k[7:]] = v
+                elif not k.startswith("module.") and isinstance(model, nn.DataParallel):
+                    new_state_dict[f"module.{k}"] = v
+                else:
+                    new_state_dict[k] = v
+            model.load_state_dict(new_state_dict)
+            print("✅ Checkpoint weights loaded successfully.")
+        except Exception as e:
+            print(f"Warning: Failed to load checkpoint weights: {e}")
     
     # Calculate parameter count
     total_params = sum(p.numel() for p in model.parameters())
@@ -189,7 +246,14 @@ def run_campaign(args):
         if step_count >= args.max_steps:
             break
             
-        for batch in dataloader:
+        # Re-initialize generator for streaming if using fineweb-edu at the start of epoch
+        if args.dataset == "fineweb-edu":
+            dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10B", split="train", streaming=True)
+            epoch_dataloader = stream_batches(dataset, tokenizer, args.batch_size, args.seq_len)
+        else:
+            epoch_dataloader = dataloader
+            
+        for batch in epoch_dataloader:
             if step_count >= args.max_steps:
                 break
                 
@@ -343,6 +407,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_interval", type=int, default=100, help="Steps interval to save and upload checkpoints")
     parser.add_argument("--hf_repo", type=str, default=None, help="Hugging Face repository ID")
     parser.add_argument("--hf_token", type=str, default=None, help="Hugging Face API token")
+    parser.add_argument("--dataset", type=str, default="wikitext", choices=["wikitext", "fineweb-edu"], help="Dataset to train on")
     parser.add_argument("--verify_only", action="store_true", help="If set, runs tiny verification run")
     
     args = parser.parse_args()
