@@ -210,19 +210,66 @@ def run_campaign(args):
         step_count = args.start_step
         print(f"Set manual starting step count: {step_count}")
         
-    # 3.5 Auto-Resume from Checkpoint (Full State)
+    # 3.5 Auto-Resume from Checkpoint (Full State & Auto-Detection)
     checkpoint_dir = "checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, "pssa_llm_kaggle.pth")
     
-    if not os.path.exists(checkpoint_path) and args.hf_repo and args.hf_token:
+    # 1. Hugging Face Checkpoint Auto-Detection
+    if args.hf_repo and args.hf_token:
         try:
-            from huggingface_hub import hf_hub_download
-            print(f"📡 Downloading latest checkpoint from Hugging Face repository '{args.hf_repo}'...")
-            hf_hub_download(repo_id=args.hf_repo, filename="pssa_llm_kaggle.pth", token=args.hf_token, local_dir=".")
-            print("✅ Checkpoint downloaded successfully.")
+            from huggingface_hub import HfApi, hf_hub_download
+            api = HfApi()
+            print("📡 Scanning Hugging Face Hub for the latest checkpoint...")
+            files = api.list_repo_files(repo_id=args.hf_repo, token=args.hf_token)
+            
+            # Find files like pssa_llm_kaggle_step_*.pth
+            step_files = []
+            for f in files:
+                if f.startswith("pssa_llm_kaggle_step_") and f.endswith(".pth"):
+                    try:
+                        step_num = int(f.split("_")[-1].split(".")[0])
+                        step_files.append((step_num, f))
+                    except:
+                        pass
+            
+            if len(step_files) > 0:
+                # Find the file with the highest step number
+                max_step, latest_file = max(step_files, key=lambda x: x[0])
+                print(f"📡 Found latest step checkpoint '{latest_file}' (Step {max_step}) on Hugging Face Hub.")
+                
+                # Check if we should download it
+                local_step_path = os.path.join(checkpoint_dir, latest_file)
+                if not os.path.exists(local_step_path):
+                    print(f"📡 Downloading '{latest_file}'...")
+                    hf_hub_download(repo_id=args.hf_repo, filename=latest_file, token=args.hf_token, local_dir=".")
+                checkpoint_path = local_step_path
+            else:
+                # Fallback to default name
+                if not os.path.exists(checkpoint_path):
+                    print(f"📡 Downloading 'pssa_llm_kaggle.pth' from Hugging Face...")
+                    hf_hub_download(repo_id=args.hf_repo, filename="pssa_llm_kaggle.pth", token=args.hf_token, local_dir=".")
         except Exception as e:
-            print(f"[HF WARNING] Failed to download checkpoint from Hugging Face: {e}")
+            print(f"[HF WARNING] Failed to scan or download from Hugging Face: {e}")
+            
+    # 2. Local Checkpoint Auto-Detection (if HF didn't override it or if HF is offline)
+    if not os.path.exists(checkpoint_path) or checkpoint_path == os.path.join(checkpoint_dir, "pssa_llm_kaggle.pth"):
+        try:
+            local_files = os.listdir(checkpoint_dir)
+            step_files = []
+            for f in local_files:
+                if f.startswith("pssa_llm_kaggle_step_") and f.endswith(".pth"):
+                    try:
+                        step_num = int(f.split("_")[-1].split(".")[0])
+                        step_files.append((step_num, f))
+                    except:
+                        pass
+            if len(step_files) > 0:
+                max_step, latest_file = max(step_files, key=lambda x: x[0])
+                checkpoint_path = os.path.join(checkpoint_dir, latest_file)
+                print(f"🔄 Local latest step checkpoint detected: '{checkpoint_path}' (Step {max_step})")
+        except Exception as e:
+            print(f"Warning: Failed to scan local checkpoints: {e}")
             
     if os.path.exists(checkpoint_path):
         print(f"🔄 Found existing checkpoint at '{checkpoint_path}'. Resuming training...")
