@@ -463,12 +463,12 @@ def run_campaign():
             checkpoint_corrupted = True
 
     # ── Step 2: NOW load model and checkpoint onto GPU ─────────────────────────
-    d_model = 256
+    d_model = 192
     num_layers = 6
     num_slots = 8
     
     if global_rank == 0:
-        print(f"Initializing ~50M Parameter PSSA Model...")
+        print(f"Initializing 100M Parameter PSSA Model...")
     model = PSSAGPT(
         vocab_size=vocab_size, 
         d_model=d_model, 
