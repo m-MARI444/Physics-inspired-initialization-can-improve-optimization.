@@ -419,7 +419,7 @@ def run_relational_distillation(model, teacher_name, get_batch_fn, device, hf_to
         recon_loss = s_outputs[9]
         
         # Compute logit alignment (prediction energy)
-        loss_pred = F.cross_entropy(s_logits.view(-1, s_logits.size(-1)), targets.view(-1))
+        loss_pred = F.cross_entropy(s_logits.reshape(-1, s_logits.size(-1)), targets.reshape(-1))
         
         # Compute relational distillation energy across layers
         loss_relation = torch.tensor(0.0, device=device)
